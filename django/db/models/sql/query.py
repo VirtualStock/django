@@ -110,7 +110,7 @@ class Query(object):
         # type they are. The key is the alias of the joined table (possibly
         # the table name) and the value is JoinInfo from constants.py.
         self.alias_map = {}
-        self.table_map = {}     # Maps table names to list of aliases.
+        self.table_map = {}  # Maps table names to list of aliases.
         self.join_map = {}
         self.default_cols = True
         self.default_ordering = True
@@ -128,7 +128,7 @@ class Query(object):
         # The related_select_cols is used for columns needed for
         # select_related - this is populated in compile stage.
         self.related_select_cols = []
-        self.tables = []    # Aliases in the order they are created.
+        self.tables = []  # Aliases in the order they are created.
         self.where = where()
         self.where_class = where
         self.group_by = None
@@ -142,7 +142,7 @@ class Query(object):
         self.select_related = False
 
         # SQL aggregate-related attributes
-        self.aggregates = SortedDict() # Maps alias -> SQL aggregate function
+        self.aggregates = SortedDict()  # Maps alias -> SQL aggregate function
         self.aggregate_select_mask = None
         self._aggregate_select_cache = None
 
@@ -273,6 +273,10 @@ class Query(object):
         else:
             obj.used_aliases = set()
         obj.filter_is_sticky = False
+
+        # virtualstock hack
+        if hasattr(self, '_replace'):
+            obj._replace = self._replace
 
         obj.__dict__.update(kwargs)
         if hasattr(obj, '_setup_query'):
@@ -1790,7 +1794,7 @@ class Query(object):
             return self._aggregate_select_cache
         elif self.aggregate_select_mask is not None:
             self._aggregate_select_cache = SortedDict([
-                (k,v) for k,v in self.aggregates.items()
+                (k, v) for k, v in self.aggregates.items()
                 if k in self.aggregate_select_mask
             ])
             return self._aggregate_select_cache
@@ -1803,7 +1807,7 @@ class Query(object):
             return self._extra_select_cache
         elif self.extra_select_mask is not None:
             self._extra_select_cache = SortedDict([
-                (k,v) for k,v in self.extra.items()
+                (k, v) for k, v in self.extra.items()
                 if k in self.extra_select_mask
             ])
             return self._extra_select_cache

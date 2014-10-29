@@ -156,7 +156,15 @@ class SQLCompiler(object):
         # Finally do cleanup - get rid of the joins we created above.
         self.query.reset_refcounts(self.refcounts_before)
 
-        return ' '.join(result), tuple(params)
+        sql = ' '.join(result)
+
+        # virtualstock hack
+        sr = getattr(self.query, '_replace', None)
+        if sr:
+            search, replace = sr
+            sql = sql.replace(search, replace)
+
+        return sql, tuple(params)
 
     def as_nested_sql(self):
         """
