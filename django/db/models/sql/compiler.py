@@ -159,8 +159,8 @@ class SQLCompiler(object):
         sql = ' '.join(result)
 
         # virtualstock hack
-        sr = getattr(self.query, '_replace', None)
-        if sr:
+        _replace = getattr(self.query, '_replace', [])
+        for sr in _replace:
             search, replace = sr
             sql = sql.replace(search, replace)
 
