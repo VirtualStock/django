@@ -1,26 +1,21 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
-from django.utils.six import StringIO
 import sys
 
 from django.apps import apps
-from django.conf import settings
 from django.core import checks
 from django.core.checks import Error, Warning
-from django.core.checks.model_checks import check_all_models
 from django.core.checks.registry import CheckRegistry
-from django.core.checks.compatibility.django_1_6_0 import check_1_6_compatibility
-from django.core.checks.compatibility.django_1_7_0 import check_1_7_compatibility
-from django.core.management.base import CommandError
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import models
-from django.db.models.fields import NOT_PROVIDED
-from django.test import TestCase
+from django.test import SimpleTestCase
 from django.test.utils import override_settings, override_system_checks
 from django.utils.encoding import force_text
+from django.utils.six import StringIO
 
-from .models import SimpleModel, Book
+from .models import SimpleModel
 
 
 class DummyObj(object):
@@ -28,23 +23,53 @@ class DummyObj(object):
         return "obj"
 
 
-class SystemCheckFrameworkTests(TestCase):
+class SystemCheckFrameworkTests(SimpleTestCase):
 
     def test_register_and_run_checks(self):
-        calls = [0]
 
-        registry = CheckRegistry()
-
-        @registry.register()
         def f(**kwargs):
             calls[0] += 1
             return [1, 2, 3]
+
+        def f2(**kwargs):
+            return [4, ]
+
+        def f3(**kwargs):
+            return [5, ]
+
+        calls = [0]
+
+        # test register as decorator
+        registry = CheckRegistry()
+        registry.register()(f)
+        registry.register("tag1", "tag2")(f2)
+        registry.register("tag2", deploy=True)(f3)
+
+        # test register as function
+        registry2 = CheckRegistry()
+        registry2.register(f)
+        registry2.register(f2, "tag1", "tag2")
+        registry2.register(f3, "tag2", deploy=True)
+
+        # check results
         errors = registry.run_checks()
-        self.assertEqual(errors, [1, 2, 3])
-        self.assertEqual(calls[0], 1)
+        errors2 = registry2.run_checks()
+        self.assertEqual(errors, errors2)
+        self.assertEqual(sorted(errors), [1, 2, 3, 4])
+        self.assertEqual(calls[0], 2)
+
+        errors = registry.run_checks(tags=["tag1"])
+        errors2 = registry2.run_checks(tags=["tag1"])
+        self.assertEqual(errors, errors2)
+        self.assertEqual(sorted(errors), [4])
+
+        errors = registry.run_checks(tags=["tag1", "tag2"], include_deployment_checks=True)
+        errors2 = registry2.run_checks(tags=["tag1", "tag2"], include_deployment_checks=True)
+        self.assertEqual(errors, errors2)
+        self.assertEqual(sorted(errors), [4, 5])
 
 
-class MessageTests(TestCase):
+class MessageTests(SimpleTestCase):
 
     def test_printing(self):
         e = Error("Message", hint="Hint", obj=DummyObj())
@@ -84,66 +109,6 @@ class MessageTests(TestCase):
         self.assertEqual(force_text(e), expected)
 
 
-class Django_1_6_0_CompatibilityChecks(TestCase):
-
-    @override_settings(TEST_RUNNER='myapp.test.CustomRunner')
-    def test_boolean_field_default_value(self):
-        # We patch the field's default value to trigger the warning
-        boolean_field = Book._meta.get_field('is_published')
-        old_default = boolean_field.default
-        try:
-            boolean_field.default = NOT_PROVIDED
-            errors = check_1_6_compatibility()
-            expected = [
-                checks.Warning(
-                    'BooleanField does not have a default value.',
-                    hint=('Django 1.6 changed the default value of BooleanField from False to None. '
-                          'See https://docs.djangoproject.com/en/1.6/ref/models/fields/#booleanfield '
-                          'for more information.'),
-                    obj=boolean_field,
-                    id='1_6.W002',
-                )
-            ]
-            self.assertEqual(errors, expected)
-        finally:
-            # Restore the ``default``
-            boolean_field.default = old_default
-
-
-class Django_1_7_0_CompatibilityChecks(TestCase):
-
-    @override_settings(MIDDLEWARE_CLASSES=('django.contrib.sessions.middleware.SessionMiddleware',))
-    def test_middleware_classes_overridden(self):
-        errors = check_1_7_compatibility()
-        self.assertEqual(errors, [])
-
-    def test_middleware_classes_not_set_explicitly(self):
-        # If MIDDLEWARE_CLASSES was set explicitly, temporarily pretend it wasn't
-        middleware_classes_overridden = False
-        if 'MIDDLEWARE_CLASSES' in settings._wrapped._explicit_settings:
-            middleware_classes_overridden = True
-            settings._wrapped._explicit_settings.remove('MIDDLEWARE_CLASSES')
-        try:
-            errors = check_1_7_compatibility()
-            expected = [
-                checks.Warning(
-                    "MIDDLEWARE_CLASSES is not set.",
-                    hint=("Django 1.7 changed the global defaults for the MIDDLEWARE_CLASSES. "
-                          "django.contrib.sessions.middleware.SessionMiddleware, "
-                          "django.contrib.auth.middleware.AuthenticationMiddleware, and "
-                          "django.contrib.messages.middleware.MessageMiddleware were removed from the defaults. "
-                          "If your project needs these middleware then you should configure this setting."),
-                    obj=None,
-                    id='1_7.W001',
-                )
-            ]
-            self.assertEqual(errors, expected)
-        finally:
-            # Restore settings value
-            if middleware_classes_overridden:
-                settings._wrapped._explicit_settings.add('MIDDLEWARE_CLASSES')
-
-
 def simple_system_check(**kwargs):
     simple_system_check.kwargs = kwargs
     return []
@@ -161,7 +126,7 @@ def deployment_system_check(**kwargs):
 deployment_system_check.tags = ['deploymenttag']
 
 
-class CheckCommandTests(TestCase):
+class CheckCommandTests(SimpleTestCase):
 
     def setUp(self):
         simple_system_check.kwargs = None
@@ -248,7 +213,7 @@ def custom_warning_system_check(app_configs, **kwargs):
     ]
 
 
-class SilencingCheckTests(TestCase):
+class SilencingCheckTests(SimpleTestCase):
 
     def setUp(self):
         self.old_stdout, self.old_stderr = sys.stdout, sys.stderr
@@ -290,8 +255,7 @@ class SilencingCheckTests(TestCase):
         self.assertEqual(err.getvalue(), '')
 
 
-class CheckFrameworkReservedNamesTests(TestCase):
-
+class IsolateModelsMixin(object):
     def setUp(self):
         self.current_models = apps.all_models[__package__]
         self.saved_models = set(self.current_models)
@@ -301,7 +265,12 @@ class CheckFrameworkReservedNamesTests(TestCase):
             del self.current_models[model]
         apps.clear_cache()
 
-    @override_settings(SILENCED_SYSTEM_CHECKS=['models.E020'])
+
+class CheckFrameworkReservedNamesTests(IsolateModelsMixin, SimpleTestCase):
+    @override_settings(
+        SILENCED_SYSTEM_CHECKS=['models.E20', 'fields.W342'],  # ForeignKey(unique=True)
+        INSTALLED_APPS=['django.contrib.auth', 'django.contrib.contenttypes', 'check_framework']
+    )
     def test_model_check_method_not_shadowed(self):
         class ModelWithAttributeCalledCheck(models.Model):
             check = 42
@@ -316,6 +285,7 @@ class CheckFrameworkReservedNamesTests(TestCase):
             check = models.ForeignKey(ModelWithRelatedManagerCalledCheck)
             article = models.ForeignKey(ModelWithRelatedManagerCalledCheck, related_name='check')
 
+        errors = checks.run_checks()
         expected = [
             Error(
                 "The 'ModelWithAttributeCalledCheck.check()' class method is "
@@ -339,5 +309,4 @@ class CheckFrameworkReservedNamesTests(TestCase):
                 id='models.E020'
             ),
         ]
-
-        self.assertEqual(check_all_models(), expected)
+        self.assertEqual(errors, expected)
