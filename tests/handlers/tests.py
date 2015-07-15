@@ -2,16 +2,17 @@
 
 from __future__ import unicode_literals
 
-from django.core.handlers.wsgi import WSGIHandler, WSGIRequest
-from django.core.signals import request_started, request_finished
+from django.core.handlers.wsgi import WSGIHandler, WSGIRequest, get_script_name
+from django.core.signals import request_finished, request_started
 from django.db import close_old_connections, connection
-from django.test import RequestFactory, TestCase, TransactionTestCase
-from django.test import override_settings
-from django.utils.encoding import force_str
+from django.test import (
+    RequestFactory, SimpleTestCase, TransactionTestCase, override_settings,
+)
 from django.utils import six
+from django.utils.encoding import force_str
 
 
-class HandlerTests(TestCase):
+class HandlerTests(SimpleTestCase):
 
     def setUp(self):
         request_started.disconnect(close_old_connections)
@@ -93,6 +94,19 @@ class HandlerTests(TestCase):
         # latest versions.
         self.assertIsInstance(request.COOKIES, dict)
 
+    @override_settings(ROOT_URLCONF='handlers.urls')
+    def test_invalid_multipart_boundary(self):
+        """
+        Invalid boundary string should produce a "Bad Request" response, not a
+        server error (#23887).
+        """
+        environ = RequestFactory().post('/malformed_post/').environ
+        environ['CONTENT_TYPE'] = 'multipart/form-data; boundary=WRONG\x07'
+        handler = WSGIHandler()
+        response = handler(environ, lambda *a, **k: None)
+        # Expect "bad request" response
+        self.assertEqual(response.status_code, 400)
+
 
 @override_settings(ROOT_URLCONF='handlers.urls')
 class TransactionsPerRequestTests(TransactionTestCase):
@@ -123,7 +137,7 @@ class TransactionsPerRequestTests(TransactionTestCase):
 
 
 @override_settings(ROOT_URLCONF='handlers.urls')
-class SignalsTests(TestCase):
+class SignalsTests(SimpleTestCase):
 
     def setUp(self):
         self.signals = []
@@ -156,7 +170,7 @@ class SignalsTests(TestCase):
 
 
 @override_settings(ROOT_URLCONF='handlers.urls')
-class HandlerSuspiciousOpsTest(TestCase):
+class HandlerSuspiciousOpsTest(SimpleTestCase):
 
     def test_suspiciousop_in_view_returns_400(self):
         response = self.client.get('/suspicious/')
@@ -164,7 +178,7 @@ class HandlerSuspiciousOpsTest(TestCase):
 
 
 @override_settings(ROOT_URLCONF='handlers.urls')
-class HandlerNotFoundTest(TestCase):
+class HandlerNotFoundTest(SimpleTestCase):
 
     def test_invalid_urls(self):
         response = self.client.get('~%A9helloworld')
@@ -186,3 +200,14 @@ class HandlerNotFoundTest(TestCase):
     def test_environ_path_info_type(self):
         environ = RequestFactory().get('/%E2%A8%87%87%A5%E2%A8%A0').environ
         self.assertIsInstance(environ['PATH_INFO'], six.text_type)
+
+
+class ScriptNameTests(SimpleTestCase):
+    def test_get_script_name(self):
+        # Regression test for #23173
+        # Test first without PATH_INFO
+        script_name = get_script_name({'SCRIPT_URL': '/foobar/'})
+        self.assertEqual(script_name, '/foobar/')
+
+        script_name = get_script_name({'SCRIPT_URL': '/foobar/', 'PATH_INFO': '/'})
+        self.assertEqual(script_name, '/foobar')

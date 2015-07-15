@@ -1,10 +1,8 @@
-from copy import copy
 import inspect
+from copy import copy
 
-from django.conf import settings
-from django.utils import timezone
 from django.utils.functional import cached_property
-from django.utils.six.moves import xrange
+from django.utils.six.moves import range
 
 from .query_utils import QueryWrapper
 
@@ -65,27 +63,47 @@ class Transform(RegisterLookupMixin):
         self.lhs = lhs
         self.init_lookups = lookups[:]
 
-    def as_sql(self, qn, connection):
+    def as_sql(self, compiler, connection):
         raise NotImplementedError
 
     @cached_property
     def output_field(self):
         return self.lhs.output_field
 
+    def copy(self):
+        return copy(self)
+
     def relabeled_clone(self, relabels):
-        return self.__class__(self.lhs.relabeled_clone(relabels))
+        copy = self.copy()
+        copy.lhs = self.lhs.relabeled_clone(relabels)
+        return copy
 
     def get_group_by_cols(self):
         return self.lhs.get_group_by_cols()
+
+    def get_bilateral_transforms(self):
+        if hasattr(self.lhs, 'get_bilateral_transforms'):
+            bilateral_transforms = self.lhs.get_bilateral_transforms()
+        else:
+            bilateral_transforms = []
+        if self.bilateral:
+            bilateral_transforms.append((self.__class__, self.init_lookups))
+        return bilateral_transforms
+
+    @cached_property
+    def contains_aggregate(self):
+        return self.lhs.contains_aggregate
 
 
 class Lookup(RegisterLookupMixin):
     lookup_name = None
 
-    def __init__(self, lhs, rhs, bilateral_transforms=None):
+    def __init__(self, lhs, rhs):
         self.lhs, self.rhs = lhs, rhs
         self.rhs = self.get_prep_lookup()
-        if bilateral_transforms is None:
+        if hasattr(self.lhs, 'get_bilateral_transforms'):
+            bilateral_transforms = self.lhs.get_bilateral_transforms()
+        else:
             bilateral_transforms = []
         if bilateral_transforms:
             # We should warn the user as soon as possible if he is trying to apply
@@ -101,7 +119,7 @@ class Lookup(RegisterLookupMixin):
             value = transform(value, lookups)
         return value
 
-    def batch_process_rhs(self, qn, connection, rhs=None):
+    def batch_process_rhs(self, compiler, connection, rhs=None):
         if rhs is None:
             rhs = self.rhs
         if self.bilateral_transforms:
@@ -110,7 +128,7 @@ class Lookup(RegisterLookupMixin):
                 value = QueryWrapper('%s',
                     [self.lhs.output_field.get_db_prep_value(p, connection)])
                 value = self.apply_bilateral_transforms(value)
-                sql, sql_params = qn.compile(value)
+                sql, sql_params = compiler.compile(value)
                 sqls.append(sql)
                 sqls_params.extend(sql_params)
         else:
@@ -127,11 +145,11 @@ class Lookup(RegisterLookupMixin):
             '%s', self.lhs.output_field.get_db_prep_lookup(
                 self.lookup_name, value, connection, prepared=True))
 
-    def process_lhs(self, qn, connection, lhs=None):
+    def process_lhs(self, compiler, connection, lhs=None):
         lhs = lhs or self.lhs
-        return qn.compile(lhs)
+        return compiler.compile(lhs)
 
-    def process_rhs(self, qn, connection):
+    def process_rhs(self, compiler, connection):
         value = self.rhs
         if self.bilateral_transforms:
             if self.rhs_is_direct_value():
@@ -148,7 +166,7 @@ class Lookup(RegisterLookupMixin):
         if hasattr(value, 'get_compiler'):
             value = value.get_compiler(connection=connection)
         if hasattr(value, 'as_sql'):
-            sql, params = qn.compile(value)
+            sql, params = compiler.compile(value)
             return '(' + sql + ')', params
         if hasattr(value, '_as_sql'):
             sql, params = value._as_sql(connection=connection)
@@ -175,24 +193,28 @@ class Lookup(RegisterLookupMixin):
             cols.extend(self.rhs.get_group_by_cols())
         return cols
 
-    def as_sql(self, qn, connection):
+    def as_sql(self, compiler, connection):
         raise NotImplementedError
+
+    @cached_property
+    def contains_aggregate(self):
+        return self.lhs.contains_aggregate or getattr(self.rhs, 'contains_aggregate', False)
 
 
 class BuiltinLookup(Lookup):
-    def process_lhs(self, qn, connection, lhs=None):
+    def process_lhs(self, compiler, connection, lhs=None):
         lhs_sql, params = super(BuiltinLookup, self).process_lhs(
-            qn, connection, lhs)
+            compiler, connection, lhs)
         field_internal_type = self.lhs.output_field.get_internal_type()
         db_type = self.lhs.output_field.db_type(connection=connection)
         lhs_sql = connection.ops.field_cast_sql(
             db_type, field_internal_type) % lhs_sql
-        lhs_sql = connection.ops.lookup_cast(self.lookup_name) % lhs_sql
+        lhs_sql = connection.ops.lookup_cast(self.lookup_name, field_internal_type) % lhs_sql
         return lhs_sql, params
 
-    def as_sql(self, qn, connection):
-        lhs_sql, params = self.process_lhs(qn, connection)
-        rhs_sql, rhs_params = self.process_rhs(qn, connection)
+    def as_sql(self, compiler, connection):
+        lhs_sql, params = self.process_lhs(compiler, connection)
+        rhs_sql, rhs_params = self.process_rhs(compiler, connection)
         params.extend(rhs_params)
         rhs_sql = self.get_rhs_op(connection, rhs_sql)
         return '%s %s' % (lhs_sql, rhs_sql), params
@@ -211,17 +233,15 @@ default_lookups['exact'] = Exact
 
 class IExact(BuiltinLookup):
     lookup_name = 'iexact'
+
+    def process_rhs(self, qn, connection):
+        rhs, params = super(IExact, self).process_rhs(qn, connection)
+        if params:
+            params[0] = connection.ops.prep_for_iexact_query(params[0])
+        return rhs, params
+
+
 default_lookups['iexact'] = IExact
-
-
-class Contains(BuiltinLookup):
-    lookup_name = 'contains'
-default_lookups['contains'] = Contains
-
-
-class IContains(BuiltinLookup):
-    lookup_name = 'icontains'
-default_lookups['icontains'] = IContains
 
 
 class GreaterThan(BuiltinLookup):
@@ -247,7 +267,7 @@ default_lookups['lte'] = LessThanOrEqual
 class In(BuiltinLookup):
     lookup_name = 'in'
 
-    def process_rhs(self, qn, connection):
+    def process_rhs(self, compiler, connection):
         if self.rhs_is_direct_value():
             # rhs should be an iterable, we use batch_process_rhs
             # to prepare/transform those values
@@ -255,26 +275,26 @@ class In(BuiltinLookup):
             if not rhs:
                 from django.db.models.sql.datastructures import EmptyResultSet
                 raise EmptyResultSet
-            sqls, sqls_params = self.batch_process_rhs(qn, connection, rhs)
+            sqls, sqls_params = self.batch_process_rhs(compiler, connection, rhs)
             placeholder = '(' + ', '.join(sqls) + ')'
             return (placeholder, sqls_params)
         else:
-            return super(In, self).process_rhs(qn, connection)
+            return super(In, self).process_rhs(compiler, connection)
 
     def get_rhs_op(self, connection, rhs):
         return 'IN %s' % rhs
 
-    def as_sql(self, qn, connection):
+    def as_sql(self, compiler, connection):
         max_in_list_size = connection.ops.max_in_list_size()
         if self.rhs_is_direct_value() and (max_in_list_size and
                                            len(self.rhs) > max_in_list_size):
             # This is a special case for Oracle which limits the number of elements
             # which can appear in an 'IN' clause.
-            lhs, lhs_params = self.process_lhs(qn, connection)
-            rhs, rhs_params = self.batch_process_rhs(qn, connection)
+            lhs, lhs_params = self.process_lhs(compiler, connection)
+            rhs, rhs_params = self.batch_process_rhs(compiler, connection)
             in_clause_elements = ['(']
             params = []
-            for offset in xrange(0, len(rhs_params), max_in_list_size):
+            for offset in range(0, len(rhs_params), max_in_list_size):
                 if offset > 0:
                     in_clause_elements.append(' OR ')
                 in_clause_elements.append('%s IN (' % lhs)
@@ -288,13 +308,14 @@ class In(BuiltinLookup):
             in_clause_elements.append(')')
             return ''.join(in_clause_elements), params
         else:
-            return super(In, self).as_sql(qn, connection)
+            return super(In, self).as_sql(compiler, connection)
 
 
 default_lookups['in'] = In
 
 
 class PatternLookup(BuiltinLookup):
+
     def get_rhs_op(self, connection, rhs):
         # Assume we are in startswith. We need to produce SQL like:
         #     col LIKE %s, ['thevalue%']
@@ -307,28 +328,81 @@ class PatternLookup(BuiltinLookup):
         # pattern added.
         if (hasattr(self.rhs, 'get_compiler') or hasattr(self.rhs, 'as_sql')
                 or hasattr(self.rhs, '_as_sql') or self.bilateral_transforms):
-            return connection.pattern_ops[self.lookup_name] % rhs
+            pattern = connection.pattern_ops[self.lookup_name].format(connection.pattern_esc)
+            return pattern.format(rhs)
         else:
             return super(PatternLookup, self).get_rhs_op(connection, rhs)
 
 
+class Contains(PatternLookup):
+    lookup_name = 'contains'
+
+    def process_rhs(self, qn, connection):
+        rhs, params = super(Contains, self).process_rhs(qn, connection)
+        if params and not self.bilateral_transforms:
+            params[0] = "%%%s%%" % connection.ops.prep_for_like_query(params[0])
+        return rhs, params
+
+
+default_lookups['contains'] = Contains
+
+
+class IContains(Contains):
+    lookup_name = 'icontains'
+
+
+default_lookups['icontains'] = IContains
+
+
 class StartsWith(PatternLookup):
     lookup_name = 'startswith'
+
+    def process_rhs(self, qn, connection):
+        rhs, params = super(StartsWith, self).process_rhs(qn, connection)
+        if params and not self.bilateral_transforms:
+            params[0] = "%s%%" % connection.ops.prep_for_like_query(params[0])
+        return rhs, params
+
+
 default_lookups['startswith'] = StartsWith
 
 
 class IStartsWith(PatternLookup):
     lookup_name = 'istartswith'
+
+    def process_rhs(self, qn, connection):
+        rhs, params = super(IStartsWith, self).process_rhs(qn, connection)
+        if params and not self.bilateral_transforms:
+            params[0] = "%s%%" % connection.ops.prep_for_like_query(params[0])
+        return rhs, params
+
+
 default_lookups['istartswith'] = IStartsWith
 
 
-class EndsWith(BuiltinLookup):
+class EndsWith(PatternLookup):
     lookup_name = 'endswith'
+
+    def process_rhs(self, qn, connection):
+        rhs, params = super(EndsWith, self).process_rhs(qn, connection)
+        if params and not self.bilateral_transforms:
+            params[0] = "%%%s" % connection.ops.prep_for_like_query(params[0])
+        return rhs, params
+
+
 default_lookups['endswith'] = EndsWith
 
 
-class IEndsWith(BuiltinLookup):
+class IEndsWith(PatternLookup):
     lookup_name = 'iendswith'
+
+    def process_rhs(self, qn, connection):
+        rhs, params = super(IEndsWith, self).process_rhs(qn, connection)
+        if params and not self.bilateral_transforms:
+            params[0] = "%%%s" % connection.ops.prep_for_like_query(params[0])
+        return rhs, params
+
+
 default_lookups['iendswith'] = IEndsWith
 
 
@@ -337,84 +411,28 @@ class Between(BuiltinLookup):
         return "BETWEEN %s AND %s" % (rhs, rhs)
 
 
-class Year(Between):
-    lookup_name = 'year'
-default_lookups['year'] = Year
-
-
 class Range(BuiltinLookup):
     lookup_name = 'range'
 
     def get_rhs_op(self, connection, rhs):
         return "BETWEEN %s AND %s" % (rhs[0], rhs[1])
 
-    def process_rhs(self, qn, connection):
+    def process_rhs(self, compiler, connection):
         if self.rhs_is_direct_value():
             # rhs should be an iterable of 2 values, we use batch_process_rhs
             # to prepare/transform those values
-            return self.batch_process_rhs(qn, connection)
+            return self.batch_process_rhs(compiler, connection)
         else:
-            return super(Range, self).process_rhs(qn, connection)
+            return super(Range, self).process_rhs(compiler, connection)
 
 default_lookups['range'] = Range
-
-
-class DateLookup(BuiltinLookup):
-    def process_lhs(self, qn, connection, lhs=None):
-        from django.db.models import DateTimeField
-        lhs, params = super(DateLookup, self).process_lhs(qn, connection, lhs)
-        if isinstance(self.lhs.output_field, DateTimeField):
-            tzname = timezone.get_current_timezone_name() if settings.USE_TZ else None
-            sql, tz_params = connection.ops.datetime_extract_sql(self.extract_type, lhs, tzname)
-            return connection.ops.lookup_cast(self.lookup_name) % sql, tz_params
-        else:
-            return connection.ops.date_extract_sql(self.lookup_name, lhs), []
-
-    def get_rhs_op(self, connection, rhs):
-        return '= %s' % rhs
-
-
-class Month(DateLookup):
-    lookup_name = 'month'
-    extract_type = 'month'
-default_lookups['month'] = Month
-
-
-class Day(DateLookup):
-    lookup_name = 'day'
-    extract_type = 'day'
-default_lookups['day'] = Day
-
-
-class WeekDay(DateLookup):
-    lookup_name = 'week_day'
-    extract_type = 'week_day'
-default_lookups['week_day'] = WeekDay
-
-
-class Hour(DateLookup):
-    lookup_name = 'hour'
-    extract_type = 'hour'
-default_lookups['hour'] = Hour
-
-
-class Minute(DateLookup):
-    lookup_name = 'minute'
-    extract_type = 'minute'
-default_lookups['minute'] = Minute
-
-
-class Second(DateLookup):
-    lookup_name = 'second'
-    extract_type = 'second'
-default_lookups['second'] = Second
 
 
 class IsNull(BuiltinLookup):
     lookup_name = 'isnull'
 
-    def as_sql(self, qn, connection):
-        sql, params = qn.compile(self.lhs)
+    def as_sql(self, compiler, connection):
+        sql, params = compiler.compile(self.lhs)
         if self.rhs:
             return "%s IS NULL" % sql, params
         else:
@@ -425,9 +443,9 @@ default_lookups['isnull'] = IsNull
 class Search(BuiltinLookup):
     lookup_name = 'search'
 
-    def as_sql(self, qn, connection):
-        lhs, lhs_params = self.process_lhs(qn, connection)
-        rhs, rhs_params = self.process_rhs(qn, connection)
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
         sql_template = connection.ops.fulltext_search_sql(field_name=lhs)
         return sql_template, lhs_params + rhs_params
 
@@ -437,12 +455,12 @@ default_lookups['search'] = Search
 class Regex(BuiltinLookup):
     lookup_name = 'regex'
 
-    def as_sql(self, qn, connection):
+    def as_sql(self, compiler, connection):
         if self.lookup_name in connection.operators:
-            return super(Regex, self).as_sql(qn, connection)
+            return super(Regex, self).as_sql(compiler, connection)
         else:
-            lhs, lhs_params = self.process_lhs(qn, connection)
-            rhs, rhs_params = self.process_rhs(qn, connection)
+            lhs, lhs_params = self.process_lhs(compiler, connection)
+            rhs, rhs_params = self.process_rhs(compiler, connection)
             sql_template = connection.ops.regex_lookup(self.lookup_name)
             return sql_template % (lhs, rhs), lhs_params + rhs_params
 default_lookups['regex'] = Regex

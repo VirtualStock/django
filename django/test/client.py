@@ -1,9 +1,10 @@
 from __future__ import unicode_literals
 
-import sys
+import json
+import mimetypes
 import os
 import re
-import mimetypes
+import sys
 from copy import copy
 from importlib import import_module
 from io import BytesIO
@@ -12,27 +13,38 @@ from django.apps import apps
 from django.conf import settings
 from django.core import urlresolvers
 from django.core.handlers.base import BaseHandler
-from django.core.handlers.wsgi import WSGIRequest, ISO_8859_1, UTF_8
-from django.core.signals import (request_started, request_finished,
-    got_request_exception)
+from django.core.handlers.wsgi import ISO_8859_1, UTF_8, WSGIRequest
+from django.core.signals import (
+    got_request_exception, request_finished, request_started,
+)
 from django.db import close_old_connections
-from django.http import SimpleCookie, HttpRequest, QueryDict
+from django.http import HttpRequest, QueryDict, SimpleCookie
 from django.template import TemplateDoesNotExist
 from django.test import signals
-from django.utils.functional import curry, SimpleLazyObject
+from django.test.utils import ContextList
+from django.utils import six
 from django.utils.encoding import force_bytes, force_str, uri_to_iri
+from django.utils.functional import SimpleLazyObject, curry
 from django.utils.http import urlencode
 from django.utils.itercompat import is_iterable
-from django.utils import six
 from django.utils.six.moves.urllib.parse import urlparse, urlsplit
-from django.test.utils import ContextList
 
-__all__ = ('Client', 'RequestFactory', 'encode_file', 'encode_multipart')
+__all__ = ('Client', 'RedirectCycleError', 'RequestFactory', 'encode_file', 'encode_multipart')
 
 
 BOUNDARY = 'BoUnDaRyStRiNg'
 MULTIPART_CONTENT = 'multipart/form-data; boundary=%s' % BOUNDARY
 CONTENT_TYPE_RE = re.compile('.*; charset=([\w\d-]+);?')
+
+
+class RedirectCycleError(Exception):
+    """
+    The test client has been asked to follow a redirect loop.
+    """
+    def __init__(self, message, last_response):
+        super(RedirectCycleError, self).__init__(message)
+        self.last_response = last_response
+        self.redirect_chain = last_response.redirect_chain
 
 
 class FakePayload(object):
@@ -162,19 +174,19 @@ def encode_multipart(boundary, data):
                 if is_file(item):
                     lines.extend(encode_file(boundary, key, item))
                 else:
-                    lines.extend([to_bytes(val) for val in [
+                    lines.extend(to_bytes(val) for val in [
                         '--%s' % boundary,
                         'Content-Disposition: form-data; name="%s"' % key,
                         '',
                         item
-                    ]])
+                    ])
         else:
-            lines.extend([to_bytes(val) for val in [
+            lines.extend(to_bytes(val) for val in [
                 '--%s' % boundary,
                 'Content-Disposition: form-data; name="%s"' % key,
                 '',
                 value
-            ]])
+            ])
 
     lines.extend([
         to_bytes('--%s--' % boundary),
@@ -185,20 +197,25 @@ def encode_multipart(boundary, data):
 
 def encode_file(boundary, key, file):
     to_bytes = lambda s: force_bytes(s, settings.DEFAULT_CHARSET)
+    filename = os.path.basename(file.name) if hasattr(file, 'name') else ''
     if hasattr(file, 'content_type'):
         content_type = file.content_type
+    elif filename:
+        content_type = mimetypes.guess_type(filename)[0]
     else:
-        content_type = mimetypes.guess_type(file.name)[0]
+        content_type = None
 
     if content_type is None:
         content_type = 'application/octet-stream'
+    if not filename:
+        filename = key
     return [
         to_bytes('--%s' % boundary),
         to_bytes('Content-Disposition: form-data; name="%s"; filename="%s"'
-                 % (key, os.path.basename(file.name))),
+                 % (key, filename)),
         to_bytes('Content-Type: %s' % content_type),
         b'',
-        file.read()
+        to_bytes(file.read())
     ]
 
 
@@ -398,7 +415,7 @@ class Client(RequestFactory):
         """
         if apps.is_installed('django.contrib.sessions'):
             engine = import_module(settings.SESSION_ENGINE)
-            cookie = self.cookies.get(settings.SESSION_COOKIE_NAME, None)
+            cookie = self.cookies.get(settings.SESSION_COOKIE_NAME)
             if cookie:
                 return engine.SessionStore(cookie.value)
             else:
@@ -456,6 +473,8 @@ class Client(RequestFactory):
             # Add any rendered template detail to the response.
             response.templates = data.get("templates", [])
             response.context = data.get("context")
+
+            response.json = curry(self._parse_json, response)
 
             # Attach the ResolverMatch instance to the response
             response.resolver_match = SimpleLazyObject(
@@ -573,39 +592,48 @@ class Client(RequestFactory):
         are incorrect, or the user is inactive, or if the sessions framework is
         not available.
         """
-        from django.contrib.auth import authenticate, login
+        from django.contrib.auth import authenticate
         user = authenticate(**credentials)
         if (user and user.is_active and
                 apps.is_installed('django.contrib.sessions')):
-            engine = import_module(settings.SESSION_ENGINE)
-
-            # Create a fake request to store login details.
-            request = HttpRequest()
-
-            if self.session:
-                request.session = self.session
-            else:
-                request.session = engine.SessionStore()
-            login(request, user)
-
-            # Save the session values.
-            request.session.save()
-
-            # Set the cookie to represent the session.
-            session_cookie = settings.SESSION_COOKIE_NAME
-            self.cookies[session_cookie] = request.session.session_key
-            cookie_data = {
-                'max-age': None,
-                'path': '/',
-                'domain': settings.SESSION_COOKIE_DOMAIN,
-                'secure': settings.SESSION_COOKIE_SECURE or None,
-                'expires': None,
-            }
-            self.cookies[session_cookie].update(cookie_data)
-
+            self._login(user)
             return True
         else:
             return False
+
+    def force_login(self, user, backend=None):
+        if backend is None:
+            backend = settings.AUTHENTICATION_BACKENDS[0]
+        user.backend = backend
+        self._login(user)
+
+    def _login(self, user):
+        from django.contrib.auth import login
+        engine = import_module(settings.SESSION_ENGINE)
+
+        # Create a fake request to store login details.
+        request = HttpRequest()
+
+        if self.session:
+            request.session = self.session
+        else:
+            request.session = engine.SessionStore()
+        login(request, user)
+
+        # Save the session values.
+        request.session.save()
+
+        # Set the cookie to represent the session.
+        session_cookie = settings.SESSION_COOKIE_NAME
+        self.cookies[session_cookie] = request.session.session_key
+        cookie_data = {
+            'max-age': None,
+            'path': '/',
+            'domain': settings.SESSION_COOKIE_DOMAIN,
+            'secure': settings.SESSION_COOKIE_SECURE or None,
+            'expires': None,
+        }
+        self.cookies[session_cookie].update(cookie_data)
 
     def logout(self):
         """
@@ -625,16 +653,21 @@ class Client(RequestFactory):
         logout(request)
         self.cookies = SimpleCookie()
 
+    def _parse_json(self, response, **extra):
+        if 'application/json' not in response.get('Content-Type'):
+            raise ValueError('Content-Type header is "{0}", not "application/json"'.format(response.get('Content-Type')))
+        return json.loads(response.content.decode(), **extra)
+
     def _handle_redirects(self, response, **extra):
         "Follows any redirects by requesting responses from the server using GET."
 
         response.redirect_chain = []
         while response.status_code in (301, 302, 303, 307):
-            url = response.url
+            response_url = response.url
             redirect_chain = response.redirect_chain
-            redirect_chain.append((url, response.status_code))
+            redirect_chain.append((response_url, response.status_code))
 
-            url = urlsplit(url)
+            url = urlsplit(response_url)
             if url.scheme:
                 extra['wsgi.url_scheme'] = url.scheme
             if url.hostname:
@@ -645,7 +678,14 @@ class Client(RequestFactory):
             response = self.get(url.path, QueryDict(url.query), follow=False, **extra)
             response.redirect_chain = redirect_chain
 
-            # Prevent loops
-            if response.redirect_chain[-1] in response.redirect_chain[0:-1]:
-                break
+            if redirect_chain[-1] in redirect_chain[:-1]:
+                # Check that we're not redirecting to somewhere we've already
+                # been to, to prevent loops.
+                raise RedirectCycleError("Redirect loop detected.", last_response=response)
+            if len(redirect_chain) > 20:
+                # Such a lengthy chain likely also means a loop, but one with
+                # a growing path, changing view, or changing query argument;
+                # 20 is the value of "network.http.redirection-limit" from Firefox.
+                raise RedirectCycleError("Too many redirects.", last_response=response)
+
         return response
