@@ -176,6 +176,10 @@ class FieldsTests(SimpleTestCase):
         self.assertEqual(f.clean(' 1'), ' 1')
         self.assertEqual(f.clean('1 '), '1 ')
 
+    def test_charfield_disabled(self):
+        f = CharField(disabled=True)
+        self.assertWidgetRendersTo(f, '<input type="text" name="f" id="id_f" disabled />')
+
     # IntegerField ################################################################
 
     def test_integerfield_1(self):
@@ -1076,6 +1080,12 @@ class FieldsTests(SimpleTestCase):
         form = ChoiceFieldForm()
         self.assertEqual([('P', 'Paul')], list(form.fields['choicefield'].choices))
 
+    def test_choicefield_disabled(self):
+        f = ChoiceField(choices=[('J', 'John'), ('P', 'Paul')], disabled=True)
+        self.assertWidgetRendersTo(f,
+            '<select id="id_f" name="f" disabled><option value="J">John</option>'
+            '<option value="P">Paul</option></select>')
+
     # TypedChoiceField ############################################################
     # TypedChoiceField is just like ChoiceField, except that coerced types will
     # be returned:
@@ -1545,6 +1555,16 @@ class FieldsTests(SimpleTestCase):
     def test_slugfield_normalization(self):
         f = SlugField()
         self.assertEqual(f.clean('    aa-bb-cc    '), 'aa-bb-cc')
+
+    def test_slugfield_unicode_normalization(self):
+        f = SlugField(allow_unicode=True)
+        self.assertEqual(f.clean('a'), 'a')
+        self.assertEqual(f.clean('1'), '1')
+        self.assertEqual(f.clean('a1'), 'a1')
+        self.assertEqual(f.clean('你好'), '你好')
+        self.assertEqual(f.clean('  你-好  '), '你-好')
+        self.assertEqual(f.clean('ıçğüş'), 'ıçğüş')
+        self.assertEqual(f.clean('foo-ıç-bar'), 'foo-ıç-bar')
 
     # UUIDField ###################################################################
 

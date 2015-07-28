@@ -30,6 +30,9 @@ details on these changes.
 
 * ``Field.remote_field.to`` attribute will be removed.
 
+* The ``on_delete`` argument for ``ForeignKey`` and ``OneToOneField``  will be
+  required.
+
 * ``django.db.models.fields.add_lazy_relation()`` will be removed.
 
 * When time zone support is enabled, database backends that don't support time
@@ -81,6 +84,10 @@ details on these changes.
 
 * ``Field._get_val_from_obj()`` will be removed in favor of
   ``Field.value_from_object()``.
+
+* ``django.template.loaders.eggs.Loader`` will be removed.
+
+* The ``current_app`` parameter to the ``contrib.auth`` views will be removed.
 
 .. _deprecation-removed-in-1.10:
 
